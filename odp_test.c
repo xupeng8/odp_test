@@ -10,17 +10,9 @@
 #define NUM_TMOS              10000
 #define WAIT_NUM              10    /**< Max tries to rx last tmo per worker */
 
-#if 0
-/** Test arguments */
-typedef struct {
-    int cpu_count;     /**< CPU count*/
-    int resolution_us; /**< Timeout resolution in usec*/
-    int min_us;        /**< Minimum timeout in usec*/
-    int max_us;        /**< Maximum timeout in usec*/
-    int period_us;     /**< Timeout period in usec*/
-    int tmo_count;     /**< Timeout count*/
-} test_args_t;
-#endif
+/** Get rid of path in filename - only for unix-type paths using '/' */
+#define NO_PATH(file_name) (strrchr((file_name), '/') ? \
+        strrchr((file_name), '/') + 1 : (file_name))
 
 struct test_timer {
     odp_timer_t tim;
@@ -28,7 +20,11 @@ struct test_timer {
 };
 
 typedef struct {
-    //test_args_t args;           /*< Test argunments*/
+    int cpu_count;
+} appl_args_t;
+
+typedef struct {
+    appl_args_t appl;
     odp_barrier_t barrier;      /*< Barrier for test synchronisation*/
     odp_timer_pool_t tp;        /*< Timer pool handle*/
     odp_pool_t tmop;            /*< Timeout pool handle*/
@@ -39,6 +35,59 @@ typedef struct {
 
 /** Global pointer to args */
 static args_t *gbl_args;
+
+/**
+ * Prinf usage information
+ */
+static void usage(char *progname)
+{
+    printf("\nOpenDataPlane L2 forwarding application.\n"
+            "\nUsage: %s OPTIONS\n"
+            "  -c, --count <number> CPU count.\n"
+            "  -h, --help           Display help and exit.\n\n",
+            NO_PATH(progname)
+          );
+}
+
+static void gbl_args_init(args_t *args)
+{
+    memset(args, 0, sizeof(args_t));
+    args->tmop = ODP_POOL_INVALID;
+    args->tp = ODP_TIMER_POOL_INVALID;
+}
+
+/**
+ * Parse and store the command line arguments
+ *
+ * @param argc       argument count
+ * @param argv[]     argument vector
+ * @param appl_args  Store application arguments here
+ */
+static void parse_args(int argc, char *argv[], appl_args_t *appl_args)
+{
+    int opt;
+
+    static const char *shortopts = "c:h";
+
+    while (1) {
+        opt = getopt(argc, argv, shortopts);
+
+        if (opt == -1)
+            break;  /* No more options */
+
+        switch (opt) {
+            case 'c':
+                appl_args->cpu_count = atoi(optarg);
+                break;
+            case 'h':
+                usage(argv[0]);
+                exit(EXIT_SUCCESS);
+                break;
+            default:
+                break;
+        }
+    }
+}
 
 /** @private test timeout */
 static void remove_prescheduled_events(void)
@@ -54,8 +103,6 @@ static void remove_prescheduled_events(void)
 
 static int worker_thread(void *arg)
 {
-    //uint64_t wait;
-    //odp_event_t ev;
     odp_queue_t queue;
     struct test_timer *ttp;
     odp_timeout_t tmo;
@@ -148,19 +195,6 @@ static int worker_thread(void *arg)
         odp_event_free(ttp->ev);
         odp_timer_free(ttp->tim);
         ttp = NULL;
-#if 0
-        wait = odp_schedule_wait_time(ODP_TIME_MSEC_IN_NS * 100);
-        printf("Looping on CPU %i!\n", odp_cpu_id());
-        /* Use schedule to get buf from any input queue */
-        ev = odp_schedule(NULL, wait);
-        switch (odp_event_type(ev)) {
-            case ODP_EVENT_TIMEOUT:
-                printf("Received a timeout event on CPU %i!\n", odp_cpu_id());
-                break;
-            default:
-                break;
-        }
-#endif
     }
 
     /* Remove any prescheduled events */
@@ -207,12 +241,18 @@ int main(int argc, char *argv[])
         printf("Error: shared mem alloc failed.\n");
         exit(EXIT_FAILURE);
     }
-    memset(gbl_args, 0, sizeof(args_t));
-    gbl_args->tmop = ODP_POOL_INVALID;
-    gbl_args->tp = ODP_TIMER_POOL_INVALID;
+    /* Init global arguments */
+    gbl_args_init(gbl_args);
+
+    /* Parse and store the application arguments */
+    parse_args(argc, argv, &gbl_args->appl);
 
     /* Default to system CPU count unless user specified */
     num_workers = MAX_WORKERS;
+    if (gbl_args->appl.cpu_count)
+        num_workers = gbl_args->appl.cpu_count;
+
+    /* Get default worker cpumask */
     num_workers = odp_cpumask_default_worker(&cpumask, num_workers);
     (void)odp_cpumask_to_str(&cpumask, cpumaskstr, sizeof(cpumaskstr));
     printf("num worker threads: %i\n", num_workers);
