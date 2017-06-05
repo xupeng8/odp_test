@@ -7,6 +7,7 @@
 
 #define UNUSE(x) (x = x)
 #define MAX_WORKERS           8
+#define MAX_TIMEOUT_WORKERS   4
 #define NUM_TMOS              10000
 #define WAIT_NUM              10    /**< Max tries to rx last tmo per worker */
 
@@ -21,6 +22,7 @@ struct test_timer {
 
 typedef struct {
     int cpu_count;
+    int timeout_worker_count;
 } appl_args_t;
 
 typedef struct {
@@ -31,6 +33,7 @@ typedef struct {
     odp_atomic_u32_t remain;    /*< Number of timeouts to receive*/
     struct test_timer tt[256];  /*< Array of all timer helper structs*/
     uint32_t num_workers;       /**< Number of threads */
+    odp_schedule_group_t schedule_group_timer;
 } args_t;
 
 /** Global pointer to args */
@@ -43,9 +46,10 @@ static void usage(char *progname)
 {
     printf("\nOpenDataPlane L2 forwarding application.\n"
             "\nUsage: %s OPTIONS\n"
-            "  -c, --count <number> CPU count.\n"
+            "  -c <number> CPU count. %s will create worker thread on each CPU core.\n"
+            "  -g <number> Worker thread number in timer schedule group. this should less than CPU count.\n"
             "  -h, --help           Display help and exit.\n\n",
-            NO_PATH(progname)
+            NO_PATH(progname), NO_PATH(progname)
           );
 }
 
@@ -67,7 +71,7 @@ static void parse_args(int argc, char *argv[], appl_args_t *appl_args)
 {
     int opt;
 
-    static const char *shortopts = "c:h";
+    static const char *shortopts = "c:g:h";
 
     while (1) {
         opt = getopt(argc, argv, shortopts);
@@ -78,6 +82,9 @@ static void parse_args(int argc, char *argv[], appl_args_t *appl_args)
         switch (opt) {
             case 'c':
                 appl_args->cpu_count = atoi(optarg);
+                break;
+            case 'g':
+                appl_args->timeout_worker_count = atoi(optarg);
                 break;
             case 'h':
                 usage(argv[0]);
@@ -110,10 +117,21 @@ static int worker_thread(void *arg)
     uint64_t period;
     uint64_t period_ns;
     args_t * gbls = arg;
+    odp_thrmask_t mask;
 
     uint32_t num_workers = gbls->num_workers;
     int thr = odp_thread_id();
     int cpu = odp_cpu_id();
+
+    if (thr <= gbls->appl.timeout_worker_count ) {
+        odp_thrmask_zero(&mask);
+        odp_thrmask_set(&mask, thr);
+
+        if (odp_schedule_group_join(gbls->schedule_group_timer, &mask)) {
+            printf("Join failed\n");
+            return -1;
+        }
+    }
 
     queue = odp_queue_lookup("timer_queue");
 
@@ -217,6 +235,7 @@ int main(int argc, char *argv[])
     odp_queue_param_t param;
     odp_queue_t queue;
     odp_shm_t shm = ODP_SHM_INVALID;
+    odp_thrmask_t zero;
 
     UNUSE(argc);
     UNUSE(argv);
@@ -249,13 +268,22 @@ int main(int argc, char *argv[])
 
     /* Default to system CPU count unless user specified */
     num_workers = MAX_WORKERS;
-    if (gbl_args->appl.cpu_count)
+    if (gbl_args->appl.cpu_count) {
         num_workers = gbl_args->appl.cpu_count;
+    }
+    if (gbl_args->appl.timeout_worker_count) {
+        if (gbl_args->appl.timeout_worker_count > gbl_args->appl.cpu_count) {
+            gbl_args->appl.timeout_worker_count = gbl_args->appl.cpu_count;
+        }
+    } else {
+        gbl_args->appl.timeout_worker_count = MAX_TIMEOUT_WORKERS;
+    }
 
     /* Get default worker cpumask */
     num_workers = odp_cpumask_default_worker(&cpumask, num_workers);
     (void)odp_cpumask_to_str(&cpumask, cpumaskstr, sizeof(cpumaskstr));
     printf("num worker threads: %i\n", num_workers);
+    printf("num timeout worker threads: %i\n", gbl_args->appl.timeout_worker_count);
     printf("first CPU:          %i\n", odp_cpumask_first(&cpumask));
     printf("cpu mask:           %s\n", cpumaskstr);
 
@@ -291,12 +319,21 @@ int main(int argc, char *argv[])
     }
     odp_timer_pool_start();
 
+    odp_thrmask_zero(&zero);
+    gbl_args->schedule_group_timer = odp_schedule_group_create(
+            "sche_group_timer", &zero);
+    if (gbl_args->schedule_group_timer == ODP_SCHED_GROUP_INVALID) {
+        printf("Group create failed\n");
+        exit(EXIT_FAILURE);
+    }
+
     /* Create a queue for timer test */
     odp_queue_param_init(&param);
     param.type        = ODP_QUEUE_TYPE_SCHED;
     param.sched.prio  = ODP_SCHED_PRIO_DEFAULT;
     param.sched.sync  = ODP_SCHED_SYNC_PARALLEL;
-    param.sched.group = ODP_SCHED_GROUP_ALL;
+    //param.sched.group = ODP_SCHED_GROUP_ALL;
+    param.sched.group = gbl_args->schedule_group_timer;
 
     queue = odp_queue_create("timer_queue", &param);
     if (queue == ODP_QUEUE_INVALID) {
