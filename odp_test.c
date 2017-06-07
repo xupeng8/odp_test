@@ -26,7 +26,12 @@ typedef struct {
 } appl_args_t;
 
 typedef struct {
+    odp_queue_t queue;
+} thread_args_t;
+
+typedef struct {
     appl_args_t appl;
+    thread_args_t thread[MAX_WORKERS];
     odp_barrier_t barrier;      /*< Barrier for test synchronisation*/
     odp_timer_pool_t tp;        /*< Timer pool handle*/
     odp_pool_t tmop;            /*< Timeout pool handle*/
@@ -96,18 +101,6 @@ static void parse_args(int argc, char *argv[], appl_args_t *appl_args)
     }
 }
 
-/** @private test timeout */
-static void remove_prescheduled_events(void)
-{
-    odp_event_t ev;
-    odp_queue_t queue;
-    odp_schedule_pause();
-    while ((ev = odp_schedule(&queue, ODP_SCHED_NO_WAIT)) !=
-            ODP_EVENT_INVALID) {
-        odp_event_free(ev);
-    }
-}
-
 static int worker_thread(void *arg)
 {
     odp_queue_t queue;
@@ -116,41 +109,42 @@ static int worker_thread(void *arg)
     uint64_t tick;
     uint64_t period;
     uint64_t period_ns;
-    args_t * gbls = arg;
+    thread_args_t * thr_args = arg;
     odp_thrmask_t mask;
 
-    uint32_t num_workers = gbls->num_workers;
+    uint32_t num_workers = gbl_args->num_workers;
     int thr = odp_thread_id();
     int cpu = odp_cpu_id();
 
-    if (thr <= gbls->appl.timeout_worker_count ) {
+    if (thr <= gbl_args->appl.timeout_worker_count ) {
         odp_thrmask_zero(&mask);
         odp_thrmask_set(&mask, thr);
 
-        if (odp_schedule_group_join(gbls->schedule_group_timer, &mask)) {
+        if (odp_schedule_group_join(gbl_args->schedule_group_timer, &mask)) {
             printf("Join failed\n");
             return -1;
         }
     }
 
-    queue = odp_queue_lookup("timer_queue");
+    //queue = odp_queue_lookup("timer_queue");
+    queue = thr_args->queue;
 
     period_ns = 1000000 * ODP_TIME_USEC_IN_NS;
-    period    = odp_timer_ns_to_tick(gbls->tp, period_ns);
+    period    = odp_timer_ns_to_tick(gbl_args->tp, period_ns);
 
-    ttp = &gbls->tt[thr]; 
-    ttp->tim = odp_timer_alloc(gbls->tp, queue, ttp);
+    ttp = &gbl_args->tt[thr]; 
+    ttp->tim = odp_timer_alloc(gbl_args->tp, queue, ttp);
     if (ttp->tim == ODP_TIMER_INVALID) {
         printf("Failed to allocate timer\n");
         return -1;
     }
-    tmo = odp_timeout_alloc(gbls->tmop);
+    tmo = odp_timeout_alloc(gbl_args->tmop);
     if (tmo == ODP_TIMEOUT_INVALID) {
         printf("Failed to allocate timeout\n");
         return -1;
     }
     ttp->ev = odp_timeout_to_event(tmo);
-    tick = odp_timer_current_tick(gbls->tp);
+    tick = odp_timer_current_tick(gbl_args->tp);
 
     while(1)
     {
@@ -180,10 +174,10 @@ static int worker_thread(void *arg)
             /* Check if odp_schedule() timed out, possibly there
              *              * are no remaining timeouts to receive */
             if (++wait > WAIT_NUM &&
-                    odp_atomic_load_u32(&gbls->remain) < num_workers)
+                    odp_atomic_load_u32(&gbl_args->remain) < num_workers)
                 printf("At least one TMO was lost\n");
         } while (ev == ODP_EVENT_INVALID &&
-                (int)odp_atomic_load_u32(&gbls->remain) > 0);
+                (int)odp_atomic_load_u32(&gbl_args->remain) > 0);
 
         if (ev == ODP_EVENT_INVALID)
             break; /* No more timeouts */
@@ -203,7 +197,7 @@ static int worker_thread(void *arg)
         }
         printf("  [CPU %i, thread %i] timeout, tick %lu\n", cpu, thr, tick);
 
-        uint32_t rx_num = odp_atomic_fetch_dec_u32(&gbls->remain);
+        uint32_t rx_num = odp_atomic_fetch_dec_u32(&gbl_args->remain);
 
         if (!rx_num)
             printf("Unexpected timeout received (timer %lu, tick %lu)\n", odp_timer_to_u64(ttp->tim), tick);
@@ -214,9 +208,6 @@ static int worker_thread(void *arg)
         odp_timer_free(ttp->tim);
         ttp = NULL;
     }
-
-    /* Remove any prescheduled events */
-    remove_prescheduled_events();
 
     return 0;
 }
@@ -233,7 +224,6 @@ int main(int argc, char *argv[])
     odp_timer_pool_param_t tparams;
     odp_pool_param_t params;
     odp_queue_param_t param;
-    odp_queue_t queue;
     odp_shm_t shm = ODP_SHM_INVALID;
     odp_thrmask_t zero;
 
@@ -327,18 +317,20 @@ int main(int argc, char *argv[])
         exit(EXIT_FAILURE);
     }
 
-    /* Create a queue for timer test */
-    odp_queue_param_init(&param);
-    param.type        = ODP_QUEUE_TYPE_SCHED;
-    param.sched.prio  = ODP_SCHED_PRIO_DEFAULT;
-    param.sched.sync  = ODP_SCHED_SYNC_PARALLEL;
-    //param.sched.group = ODP_SCHED_GROUP_ALL;
-    param.sched.group = gbl_args->schedule_group_timer;
+    for (i=0; i<num_workers; i++) {
+        /* Create queue for each thread */
+        odp_queue_param_init(&param);
+        param.type        = ODP_QUEUE_TYPE_SCHED;
+        param.sched.prio  = ODP_SCHED_PRIO_DEFAULT;
+        param.sched.sync  = ODP_SCHED_SYNC_ORDERED;
+        //param.sched.group = ODP_SCHED_GROUP_ALL;
+        param.sched.group = gbl_args->schedule_group_timer;
 
-    queue = odp_queue_create("timer_queue", &param);
-    if (queue == ODP_QUEUE_INVALID) {
-        printf("Error: Timer queue create failed.\n");
-        exit(EXIT_FAILURE);
+        gbl_args->thread[i].queue = odp_queue_create("timer_queue", &param);
+        if (gbl_args->thread[i].queue == ODP_QUEUE_INVALID) {
+            printf("Error: Timer queue for thread %i create failed.\n", i);
+            exit(EXIT_FAILURE);
+        }
     }
 
     /* Create worker threads */
@@ -349,7 +341,7 @@ int main(int argc, char *argv[])
 
         memset(&thr_params, 0, sizeof(thr_params));
         thr_params.start    = worker_thread;
-        thr_params.arg      = gbl_args;
+        thr_params.arg      = &gbl_args->thread[i];
         thr_params.thr_type = ODP_THREAD_WORKER;
         thr_params.instance = instance;
 
